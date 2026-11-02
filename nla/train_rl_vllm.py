@@ -353,31 +353,46 @@ def rollout_batch_vllm(
 # workers — a function defined in this `python -m`-run (`__main__`) module can't be.
 
 
-def _vllm_load_weights_chunk(model, chunk):
+# --vllm-name-map: trainer (HF) parameter names -> the checkpoint names the engine's
+# load_weights expects. "qwen3_5_wrapper": the HF actor is the text-only
+# Qwen3_5ForCausalLM (`model.layers.*`), the engine serves the original multimodal
+# Qwen3.6 snapshot (Qwen3_5ForConditionalGeneration), whose checkpoint names are
+# `model.language_model.*` (its hf_to_vllm_mapper takes it from there). lm_head is
+# top-level in both.
+VLLM_NAME_MAPS = ("none", "qwen3_5_wrapper")
+
+
+def _vllm_name(k, name_map):
+    if name_map == "qwen3_5_wrapper" and k.startswith("model."):
+        return "model.language_model." + k[len("model."):]
+    return k
+
+
+def _vllm_load_weights_chunk(model, chunk, name_map="none"):
     """Module-level helper for vLLM's apply_model — pickle can't serialise
     local lambdas across worker processes, but it can pickle top-level fns.
     Each worker calls this with the actual model + a list of (name, tensor)."""
-    model.load_weights(iter(chunk))
+    model.load_weights(iter([(_vllm_name(n, name_map), t) for n, t in chunk]))
 
 
-def _vllm_load_weights_ipc(model, handle_chunk):
+def _vllm_load_weights_ipc(model, handle_chunk, name_map="none"):
     """vLLM apply_model helper for GPU->GPU (CUDA-IPC) weight sync.
 
     `handle_chunk` is a list of (name, (rebuild_fn, args)) where (rebuild_fn, args)
     = torch.multiprocessing.reductions.reduce_tensor(gpu_tensor) produced on the
-    trainer — a ~tiny picklable CUDA-IPC handle, NOT the ~16GB of data. Each worker
+    trainer — a ~tiny picklable CUDA-IPC handle, NOT the data. Each worker
     rebuilds the tensor (a view onto the trainer's live GPU0 buffer: zero-copy on the
     colocated rank, NVLink peer-copy for the others), copies its TP shard via
     load_weights, then synchronizes so every copy completes BEFORE the trainer
-    unmerges/overwrites the source. apply_model is synchronous, so this per-worker
+    frees or overwrites the source. apply_model is synchronous, so this per-worker
     sync is the cross-process barrier that prevents a merge/copy race."""
     import torch as _torch
-    rebuilt = [(name, fn(*args)) for name, (fn, args) in handle_chunk]
+    rebuilt = [(_vllm_name(name, name_map), fn(*args)) for name, (fn, args) in handle_chunk]
     model.load_weights(iter(rebuilt))
     _torch.cuda.synchronize()
 
 
-def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
+def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True, name_map="none"):
     """Colocate weight sync: push the LoRA-merged state to vLLM, OUT-OF-PLACE.
 
     Unlike TRL's merge_adapter() -> push -> unmerge_adapter() pattern, this never
@@ -391,23 +406,32 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
     verified bit-exact vs merge_adapter), and a crash mid-sync can no longer
     leave the actor merged.
 
+    STREAMED per decoder layer: each layer's merged tensors are built, pushed, and
+    freed before the next layer's are built (non-layer params — embed, norm,
+    lm_head — go first as one chunk). Building every merged tensor up front, as
+    this did before, holds a second copy of all adapted weights: ~50GB for a 27B
+    actor, which OOMs beside actor + critic + engine on one GPU. Per-layer chunks
+    also keep each CPU-path pickle far below vLLM v1's 4GB msgspec cap.
+
     only_adapted=True (default) pushes ONLY the LoRA-adapted weights: the
-    other ~13GB of an 8B model are frozen (LoRA-only training) and identical
-    to what vLLM loaded from --av-ckpt, so re-pushing them every step bought
-    nothing. Measured 1.5-3x faster than the old full merge-push (H200,
-    node-dependent), ~200MiB transient GPU. Auto-falls back to a full push
-    if modules_to_save is present (those train outside the deltas).
+    other weights are frozen (LoRA-only training) and identical to what vLLM
+    loaded from --av-ckpt, so re-pushing them every step buys nothing.
+    only_adapted=False pushes everything (the first sync when the engine loaded
+    different weights, --vllm-model). Auto-falls back to a full push if
+    modules_to_save is present (those train outside the deltas).
 
     ipc=True: GPU->GPU sync via CUDA-IPC handles instead of the default CPU path.
-    Ships ~tiny reduce_tensor() handles over apply_model (weights stay on GPU0;
-    workers map them — zero-copy on the colocated rank, NVLink peer-copy otherwise),
-    avoiding the ~16GB GPU->CPU->pickle->IPC->GPU round-trip done ×num_workers.
     Much faster, but needs same-node + GPU P2P; validate via FVE staying healthy
     (a botched sync makes vLLM diverge from HF -> FVE tanks).
+
+    name_map: see VLLM_NAME_MAPS.
 
     Returns wall-time in seconds.
     """
     t0 = time.time()
+    import functools as _ft
+    from collections import defaultdict
+
     from peft.tuners.lora import LoraLayer
 
     def _clean(k):
@@ -415,10 +439,7 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
             k = k[len("base_model.model."):]
         return k.replace(".base_layer.weight", ".weight").replace(".base_layer.bias", ".bias")
 
-    # Out-of-place merged deltas for every LoRA-adapted module, keyed by the
-    # cleaned state_dict name of its base weight.
-    # Map cleaned key -> module; deltas are computed LAZILY per weight in the
-    # push loop (building all ~144 delta tensors upfront held ~3GB on GPU).
+    # cleaned state_dict name of an adapted module's base weight -> the module
     lora_mods = {}
     for mn, m in actor.named_modules():
         if isinstance(m, LoraLayer) and any(
@@ -437,71 +458,60 @@ def sync_actor_to_vllm(actor, llm, ipc=False, only_adapted=True):
                     da = m.get_delta_weight(a)
                     d = da if d is None else d + da
             return d
-    if True:
-        # PEFT prepends "base_model.model." to every param name when wrapping;
-        # strip that so the names match vLLM's HF-style state_dict.
-        # Also drop the LoRA-A/B tensors themselves (they're tiny + merged below).
-        # Bucket params by layer — vLLM v1's msgspec serialiser caps a single
-        # encode at 2**32 bytes (~4 GB) and an 8B-param bf16 state_dict is
-        # ~16 GB. Push layer-by-layer matches prime-rl's NCCL broadcast
-        # pattern: "Yield non-layer weights first, then each layer's weights."
-        from collections import defaultdict
-        sd = actor.state_dict()
-        if only_adapted and any("modules_to_save" in k for k in sd):
-            print("[sync] modules_to_save present — falling back to full push", flush=True)
-            only_adapted = False
-        buckets = defaultdict(list)
-        for k, v in sd.items():
-            if "lora_" in k or "modules_to_save" in k:
-                continue
-            new_k = _clean(k)
-            if only_adapted and new_k not in lora_mods:
-                continue   # frozen + already in vLLM from --av-ckpt: skip
-            # ipc: keep on GPU (we ship a CUDA-IPC handle, not the data).
-            # else: CPU detach (the apply_model pickle path serialises the data).
+
+    # state_dict() holds references, not copies. Group by decoder layer; names
+    # are matched AFTER _clean (HF names) — the name map applies in the workers.
+    sd = actor.state_dict()
+    if only_adapted and any("modules_to_save" in k for k in sd):
+        print("[sync] modules_to_save present — falling back to full push", flush=True)
+        only_adapted = False
+    groups = defaultdict(list)
+    for k, v in sd.items():
+        if "lora_" in k or "modules_to_save" in k:
+            continue
+        new_k = _clean(k)
+        if only_adapted and new_k not in lora_mods:
+            continue   # frozen + already in vLLM: skip
+        # Layer params look like "model.layers.<N>.<...>" (Llama/Qwen family) or
+        # "transformer.h.<N>.<...>" (GPT-2/Falcon); everything else is "_other".
+        _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
+        groups[f"layer_{int(_m_layer.group(1)):03d}" if _m_layer else "_other"].append((new_k, v))
+    if ipc:
+        from torch.multiprocessing.reductions import reduce_tensor
+    n_pushed = 0
+    for group_name in ["_other"] + sorted(k for k in groups if k != "_other"):
+        chunk = []
+        for new_k, v in groups.get(group_name, []):
             if new_k in lora_mods:
                 # merged copy, fp32-accumulated then rounded once — bit-exact vs
-                # merge_adapter (peft adds the fp32 delta un-rounded on CPU;
-                # pre-rounding the delta to bf16 double-rounds). Actor untouched.
+                # merge_adapter. Actor untouched.
                 d = _delta(lora_mods[new_k])
                 t = (v.detach().float() + d.float()).to(v.dtype).detach()
                 del d
-                if not ipc:
-                    t = t.cpu()
             else:
-                t = v.detach() if ipc else v.detach().cpu()
-            # Layer params look like "model.layers.<N>.<...>" (Llama family) or
-            # "transformer.h.<N>.<...>" (GPT-2/Falcon). Non-layer params (embed,
-            # norm, lm_head) go to "_other". Arch-aware: with a hardcoded prefix
-            # a GPT-arch model dumps ~16GB into one "_other" chunk and blows
-            # msgspec's 4GB single-encode cap on the CPU-pickle path.
-            _m_layer = re.match(r"(?:model\.layers|transformer\.h)\.(\d+)\.", new_k)
-            if _m_layer:
-                buckets[f"layer_{int(_m_layer.group(1)):03d}"].append((new_k, t))
-            else:
-                buckets["_other"].append((new_k, t))
-        # Push _other first (small), then each layer in order.
-        import functools as _ft
+                t = v.detach()
+            # ipc: keep on GPU (we ship a CUDA-IPC handle, not the data).
+            chunk.append((new_k, t if ipc else t.cpu()))
+        if not chunk:
+            continue
         if ipc:
-            from torch.multiprocessing.reductions import reduce_tensor
-        for group_name in ["_other"] + sorted(k for k in buckets if k != "_other"):
-            chunk = buckets[group_name]
-            if not chunk:
-                continue
-            if ipc:
-                # reduce_tensor -> (rebuild_fn, args): a small picklable CUDA-IPC
-                # handle, NOT the data. Source tensors (the merged params) stay alive
-                # through this synchronous apply_model, so workers can safely map them.
-                handles = [(name, reduce_tensor(t)) for name, t in chunk]
-                llm.apply_model(_ft.partial(_vllm_load_weights_ipc, handle_chunk=handles))
-            else:
-                llm.apply_model(_ft.partial(_vllm_load_weights_chunk, chunk=chunk))
-        # Prefix cache keys on token IDs; weights changed, cache is stale.
-        try:
-            llm.llm_engine.reset_prefix_cache()
-        except AttributeError:
-            # Older vLLM versions: reset via apply_model
-            pass
+            # Source tensors stay alive through this synchronous apply_model, so
+            # workers can safely map them.
+            handles = [(name, reduce_tensor(t)) for name, t in chunk]
+            llm.apply_model(_ft.partial(_vllm_load_weights_ipc, handle_chunk=handles,
+                                        name_map=name_map))
+        else:
+            llm.apply_model(_ft.partial(_vllm_load_weights_chunk, chunk=chunk, name_map=name_map))
+        n_pushed += len(chunk)
+        del chunk
+    # Prefix cache keys on token IDs; weights changed, cache is stale.
+    try:
+        llm.llm_engine.reset_prefix_cache()
+    except AttributeError:
+        # Older vLLM versions: reset via apply_model
+        pass
+    if not only_adapted:
+        print(f"[sync] full push: {n_pushed} tensors ({len(lora_mods)} LoRA-merged)", flush=True)
     return time.time() - t0
 
 
@@ -702,18 +712,28 @@ def _allreduce_grads_(params, world_size, measure=False):
 
 def _assert_param_sync(named_params, world_size, tag=""):
     """Debug: all-reduce a checksum of params and assert ranks are bit-identical
-    (guards against a missed grad all-reduce silently desyncing the copies)."""
+    (guards against a missed grad all-reduce silently desyncing the copies).
+
+    Trainable params only: frozen ones can't desync, and casting every one to
+    float64 (a 27B actor's embedding alone is ~10GB in float64) OOMs on a full GPU."""
     if world_size <= 1:
         return
     import torch.distributed as dist
     c = torch.zeros((), dtype=torch.float64, device="cuda")
+    n = 0
     for _, p in named_params:
-        c += p.detach().double().sum()
+        if p.requires_grad:
+            c += p.detach().double().sum()
+            n += 1
+    assert n > 0, "no trainable params to checksum"
     hi = c.clone(); lo = c.clone()
     dist.all_reduce(hi, op=dist.ReduceOp.MAX)
     dist.all_reduce(lo, op=dist.ReduceOp.MIN)
     spread = (hi - lo).abs().item()
     assert spread < 1e-3, f"[dp] PARAM DESYNC{(' '+tag) if tag else ''}: rank spread={spread:.3e}"
+    if dist.get_rank() == 0:
+        print(f"[dp] param sync OK{(' '+tag) if tag else ''}: {n} trainable tensors, spread={spread:.1e}",
+              flush=True)
 
 
 def _any_rank(flag: bool, is_dist: bool, device) -> bool:
@@ -1058,6 +1078,19 @@ def main():
                    help="vLLM tensor_parallel_size. Set to 4 for 4-GPU runs to "
                         "speed up rollout ~3-4×. Training-side HF actor stays on "
                         "GPU 0 only (LoRA's 122M trainable params don't need FSDP).")
+    p.add_argument("--vllm-model", default=None,
+                   help="Weights the vLLM engine loads (default: --av-ckpt). The first "
+                        "sync then pushes ALL actor weights, so the engine serves the "
+                        "actor exactly. Qwen3.6: the original multimodal snapshot "
+                        "(Qwen/Qwen3.6-27B) with --vllm-name-map qwen3_5_wrapper, since "
+                        "vLLM's text-only Qwen3_5ForCausalLM can't read merged AV "
+                        "checkpoints saved under model.language_model.* names.")
+    p.add_argument("--vllm-name-map", default="none", choices=VLLM_NAME_MAPS,
+                   help="Trainer -> engine weight names for the sync. qwen3_5_wrapper "
+                        "also runs the engine text-only (no vision encoder).")
+    p.add_argument("--vllm-attn-backend", default=None,
+                   help="vLLM attention backend, e.g. TRITON_ATTN on B200 without nvcc "
+                        "(FlashInfer JIT-compiles its kernel there).")
     p.add_argument("--ipc-weight-sync", action="store_true", default=False,
                    help="GPU->GPU weight sync via CUDA-IPC handles instead of the "
                         "default GPU->CPU->pickle->IPC->GPU path. Much faster (no 16GB "
@@ -1484,7 +1517,7 @@ def main():
             "Launch WITHOUT expandable_segments to use IPC sync, or drop "
             "--ipc-weight-sync (default CPU path) / use an NCCL transport."
         )
-    print(f"[vllm] loading {args.av_ckpt} (gpu_memory_utilization={args.vllm_gpu_mem})",
+    print(f"[vllm] loading {args.vllm_model or args.av_ckpt} (gpu_memory_utilization={args.vllm_gpu_mem})",
           flush=True)
     if is_dist:
         # vLLM spawns its own TP worker group. If those workers inherit torchrun's
@@ -1528,8 +1561,15 @@ def main():
             )
         del _wx_check, _wx_src
     from vllm import LLM as VLLM
+    _engine_kw = {}
+    if args.vllm_name_map == "qwen3_5_wrapper":
+        # Text only: with every multimodal limit at 0 vLLM never builds inputs for
+        # (or profiles) the vision encoder.
+        _engine_kw["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+    if args.vllm_attn_backend:
+        _engine_kw["attention_backend"] = args.vllm_attn_backend
     llm = VLLM(
-        model=args.av_ckpt,
+        model=args.vllm_model or args.av_ckpt,
         tokenizer=args.av_ckpt,
         dtype="bfloat16",
         gpu_memory_utilization=args.vllm_gpu_mem,
@@ -1543,19 +1583,27 @@ def main():
         # so one request's cached KV — computed under ITS injection — would be
         # silently reused for a different activation. Must stay disabled.
         enable_prefix_caching=False,
+        **_engine_kw,
     )
     print(f"[vllm] ready", flush=True)
     # Initial weight sync: push the (fresh) LoRA-merged actor into vLLM.
     # At step 0 the LoRA is zero AND vLLM already loaded the same merged ckpt, so
     # this is a true no-op (~180s wasted). OFF by default; --initial-sync-warmup
     # re-enables it purely to smoke-test the sync path early.
-    if args.initial_sync_warmup or args.resume_from_lora is not None:
+    if args.vllm_model is not None:
+        # The engine holds different weights (e.g. the raw base): push everything once.
+        print(f"[vllm] initial FULL weight sync (engine loaded {args.vllm_model})", flush=True)
+        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync, only_adapted=False,
+                                       name_map=args.vllm_name_map)
+        print(f"[vllm] initial sync done in {sync_secs:.1f}s", flush=True)
+    elif args.initial_sync_warmup or args.resume_from_lora is not None:
         # MANDATORY on resume: the HF actor holds the resumed RL LoRA but vLLM
         # just loaded the SFT --av-ckpt — without this sync, step 0's rollouts
         # would come from the SFT policy (off-policy under our no-ratio surrogate).
         why = "resume" if args.resume_from_lora is not None else "warm-up"
         print(f"[vllm] initial weight sync ({why})", flush=True)
-        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+        sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync,
+                                       name_map=args.vllm_name_map)
         print(f"[vllm] initial sync done in {sync_secs:.1f}s", flush=True)
     else:
         print(f"[vllm] skipping initial sync warm-up (fresh run: vLLM already "
@@ -2090,7 +2138,8 @@ def main():
         # nothing (at grad_accum=4 that's 3 wasted syncs per real update). ----
         vllm_sync_secs = 0.0
         if is_accum_end:
-            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync)
+            vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync,
+                                                name_map=args.vllm_name_map)
             print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
 
         # ---- AR critic co-training (paper-faithful, optional) ----
