@@ -39,6 +39,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 from nla.utils import critic_predict, register_karvonen_hook
+from nla.utils.prompts import av_chat_prompt
 from nla.utils.run_config import add_config_arg, apply_config_defaults, save_resolved_config
 from nla.config import load_nla_config
 from nla.injection import karvonen_inject_in_residual
@@ -190,7 +191,7 @@ def av_generate_samples(model, tokenizer, rows, cfg, device, *,
             if isinstance(m.get("content"), str) else m
             for m in row["prompt"]
         ]
-        ptxt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        ptxt = av_chat_prompt(tokenizer, msgs)
         ids = tokenizer.encode(ptxt, add_special_tokens=False)
         pt = torch.tensor([ids], dtype=torch.long, device=device)
         act = torch.tensor(row["activation_vector"], dtype=torch.float32).unsqueeze(0).to(device)
@@ -398,9 +399,7 @@ def _av_prepare_chunk(rows, tokenizer, inject_char, device, max_len=1024):
             if isinstance(m.get("content"), str) else m
             for m in row["prompt"]
         ]
-        prompt_str = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True,
-        )
+        prompt_str = av_chat_prompt(tokenizer, msgs)
         prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
         # Response gets a trailing EOS so the model learns to stop.
         resp = row["response"] + (tokenizer.eos_token or "")
