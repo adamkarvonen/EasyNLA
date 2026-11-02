@@ -396,32 +396,39 @@ def main() -> int:
     # Per-hunk idempotency: a hunk whose NEW text is already present is skipped
     # (lets us add new hunks to an already-partially-patched file). A hunk whose
     # OLD text is missing AND whose NEW text is absent = version drift -> refuse.
-    to_apply = []
+    # Hunks are checked and applied IN ORDER against the progressively patched
+    # text: some anchors only exist after an earlier hunk (hunk 9's OLD is hunk
+    # 7's NEW), so checking all against the pristine file refused every fresh
+    # vllm-lens 1.1.0 install. Nothing is written unless every hunk resolves.
+    # A hunk whose NEW text a LATER hunk rewrote (7, rewritten by 9) is recognised
+    # by that later hunk's NEW being present, so reruns don't re-insert it.
+    patched = src
+    n_applied = 0
     for i, hunk in enumerate(HUNKS):
         old, new = hunk[0], hunk[1]
         satisfied = hunk[2] if len(hunk) > 2 else []
-        if new in src or any(alt in src for alt in satisfied):
+        later_new = [h[1] for h in HUNKS[i + 1:] if h[0] in new]
+        if new in patched or any(alt in patched for alt in satisfied) or any(n in patched for n in later_new):
             continue
-        if old not in src:
+        if old not in patched:
             print(f"[patch_vllm_lens] hunk {i} not found (neither OLD, NEW, nor a "
                   f"satisfied baseline) — vllm_lens version drift? Refusing to patch {path}")
             return 1
-        to_apply.append((old, new))
+        patched = patched.replace(old, new, 1)
+        n_applied += 1
 
-    if not to_apply:
+    if n_applied == 0:
         print(f"[patch_vllm_lens] already patched (all {len(HUNKS)} hunks): {path}")
         return 0
 
     _orig = path.with_suffix(".py.orig")
     if not _orig.exists():   # keep the PRISTINE original across incremental patches
         shutil.copy2(path, _orig)
-    for old, new in to_apply:
-        src = src.replace(old, new, 1)
-    path.write_text(src)
+    path.write_text(patched)
     pycache = path.parent / "__pycache__"
     if pycache.exists():
         shutil.rmtree(pycache)
-    print(f"[patch_vllm_lens] applied {len(to_apply)} hunk(s) to {path} "
+    print(f"[patch_vllm_lens] applied {n_applied} hunk(s) to {path} "
           f"(backup: {path.name}.orig)")
     return 0
 
