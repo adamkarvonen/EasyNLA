@@ -157,7 +157,9 @@ def check_ar():
           f"{len(ours) - n - len(head)} other entries: {[k for k in ours if not k.startswith(('backbone.model.layers', 'value_head'))]}")
 
 
-@app.function(gpu=os.environ.get("NLA_GPUS", "B200"), volumes=VOLS, timeout=24 * 3600, memory=524288,
+# memory: (request, limit) in MiB. Each DP rank stages actor + AR through CPU RAM at load, so 8 ranks can burst past
+# the 512 GiB request.
+@app.function(gpu=os.environ.get("NLA_GPUS", "B200"), volumes=VOLS, timeout=24 * 3600, memory=(524288, 1048576),
               secrets=[modal.Secret.from_local_environ(["WANDB_API_KEY", "HF_TOKEN"])])
 def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4, eval_every: int = 5,
        eval_n_prompts: int = 64, rows: str = "/data/q38_L42_20k/rl_shuf.parquet", val_rows: int = 5000,
