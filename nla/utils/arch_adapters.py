@@ -269,10 +269,12 @@ def resolve_lora_target_modules(config: Any) -> list[str] | str:
         # tower (model.visual.*) and the multi-token-prediction head (mtp.*)
         # are both left alone — adapting either trains params the NLA never
         # uses. `conv1d` is a Conv1d, not a Linear, so it is not listed.
-        return (r".*language_model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
-                r"|.*language_model\.layers\.\d+\.linear_attn\."
-                r"(in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)"
-                r"|.*language_model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)")
+        # The text-only Qwen3_5ForCausalLM (the merged AV/AR checkpoints) names
+        # its decoder `model.layers.*`, without `language_model.`: accept both.
+        layers = r"(?:.*\.)?(?:language_model|model)\.layers\.\d+\."
+        return (layers + r"self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+                r"|" + layers + r"linear_attn\.(in_proj_qkv|in_proj_a|in_proj_b|in_proj_z|out_proj)"
+                r"|" + layers + r"mlp\.(gate_proj|up_proj|down_proj)")
     raise AssertionError(
         f"model_type={model_type!r}: unknown module naming — extend "
         f"arch_adapters.resolve_lora_target_modules for this architecture."
