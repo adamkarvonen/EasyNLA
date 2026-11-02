@@ -2590,6 +2590,15 @@ def main():
             print(f"[save] LoRA → {out_dir} (+ optim_latest @ step {step + 1})"
                   + (f" (+ critic_latest @ step {step + 1})" if args.train_critic else ""))
 
+        # rank0 alone runs the held-out eval and the checkpoint save (critic merge -> save ->
+        # unmerge). Release the blocks they leave cached: at 27B on a full B200, rank0 OOMed
+        # in the policy update right after a save (180MB short, allocator fragmented).
+        if is_main and ((step + 1) % args.save_every == 0
+                        or (args.eval_every > 0 and step % args.eval_every == 0)):
+            import gc as _gc
+            _gc.collect()
+            torch.cuda.empty_cache()
+
         if is_dist:
             if args.assert_param_sync:
                 _assert_param_sync(actor.named_parameters(), world_size, tag=f"step{step}")

@@ -16,6 +16,11 @@ launch. Stages:
     NLA_GPUS=B200:8 modal run scripts/modal_qwen38_rl.py::rl --name q38_l42_rl --n-gpus 8 --num-steps 100 \
         --batch-prompts 504 --eval-every 10 --eval-n-prompts 128 --save-every 25
 
+Resume an interrupted run from its last checkpoint (optimizer state and data cursor continue; the AR restarts from
+the run's critic_latest with a fresh LoRA, as EasyNLA's --ar-lora resume does):
+
+    NLA_GPUS=B200:4 modal run scripts/modal_qwen38_rl.py::rl --name <wandb name> --resume <run>/iter_000050 ...
+
 Modal names (app, volumes) carry the adam- prefix of the workspace this was run in; change APP/VOLUME names to reuse.
 """
 
@@ -163,10 +168,10 @@ def check_ar():
               secrets=[modal.Secret.from_local_environ(["WANDB_API_KEY", "HF_TOKEN"])])
 def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4, eval_every: int = 5,
        eval_n_prompts: int = 64, rows: str = "/data/q38_L42_20k/rl_shuf.parquet", val_rows: int = 5000,
-       n_gpus: int = 1, save_every: int = 0, vllm_gpu_mem: float = 0.38, critic_micro_batch: int = 2,
-       wandb_project: str = "adam-nla-finetune", extra: str = ""):
+       n_gpus: int = 1, save_every: int = 0, vllm_gpu_mem: float = 0.36, critic_micro_batch: int = 2,
+       wandb_project: str = "adam-nla-finetune", resume: str = "", extra: str = ""):
     """nla.train_rl_vllm resumed from the 3.6 NLA. The 3.6 run's run_config.yaml hyperparameters, except, for memory on
-    B200: vllm gpu mem 0.38 (0.4), logp micro-batch 2 (8), critic micro-batch 2 (4). NLA_GPUS (read when the app is
+    B200: vllm gpu mem 0.36 (0.4), logp micro-batch 2 (8), critic micro-batch 2 (4). NLA_GPUS (read when the app is
     built locally, e.g. B200:8) must match n_gpus."""
     import shlex
     import sys
@@ -181,10 +186,14 @@ def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4,
     launch = ([sys.executable, "-m", "nla.train_rl_vllm"] if n_gpus == 1 else
               [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={n_gpus}",
                "-m", "nla.train_rl_vllm"])
+    # resume: continue an interrupted run from its own checkpoint (iter_* in its save dir: LoRA, optim_latest with the
+    # step, critic_latest); otherwise start from the published AV adapter.
+    resume_lora = f"/data/runs/{resume}" if resume else f"{d}/{NLA_ADAPTER}"
+    save_dir = f"/data/runs/{resume.split('/')[0]}" if resume else f"/data/runs/{name}"
     _run([*launch,
-          "--av-ckpt", f"{d}/av_base", "--resume-from-lora", f"{d}/{NLA_ADAPTER}",
+          "--av-ckpt", f"{d}/av_base", "--resume-from-lora", resume_lora,
           "--ar-ckpt", f"{d}/ar_reconstructor", "--ar-lora", "--ar-lora-r", "64", "--ar-lora-alpha", "16",
-          "--train-critic", "--rl-parquet", rows, "--sidecar", rows, "--save-dir", f"/data/runs/{name}",
+          "--train-critic", "--rl-parquet", rows, "--sidecar", rows, "--save-dir", save_dir,
           "--num-steps", str(num_steps), "--batch-prompts", str(batch_prompts), "--group-size", "8",
           "--max-new-tokens", "256", "--temperature", "1.0", "--lr", str(lr), "--critic-lr", "8e-5",
           "--lora-r", "64", "--lora-alpha", "16", "--kl-beta", "0.01", "--kl-estimator", "k3",
