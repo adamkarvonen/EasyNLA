@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM
+import transformers
 
 from nla.utils.arch_adapters import resolve_decoder_layers, resolve_text_config
 from nla.datagen._common import load_tokenizer
@@ -82,6 +82,7 @@ class HFExtractor(ActivationExtractor):
         max_length: int = 2048,
         batch_size: int = 16,
         attn_implementation: str = "sdpa",
+        auto_class: str = "AutoModelForCausalLM",
     ):
         self.tokenizer = load_tokenizer(model_name)
         if self.tokenizer.pad_token_id is None:
@@ -96,7 +97,11 @@ class HFExtractor(ActivationExtractor):
         # [B, heads, seq, seq] eager-attention score tensor — at batch 512 that
         # alloc hit ~300 GiB and OOM'd. sdpa keeps attention O(B·seq) in memory
         # so large no-grad extraction batches fit on an H200.
-        self.model = AutoModelForCausalLM.from_pretrained(
+        # auto_class: transformers Auto* class name. Multimodal checkpoints such as
+        # Qwen3.6/3.8 (qwen3_5) load with "AutoModelForImageTextToText"; text-only
+        # inputs never touch the vision tower, and resolve_decoder_layers finds the
+        # language model's blocks.
+        self.model = getattr(transformers, auto_class).from_pretrained(
             model_name,
             device_map=device_map,
             torch_dtype=torch_dtype,
