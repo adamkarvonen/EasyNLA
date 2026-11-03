@@ -15,7 +15,8 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).resolve().parents[2]
+# The repo root, two levels up locally; in the container this file sits alone in /root (and the repo is /opt/EasyNLA).
+REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path("/opt/EasyNLA")
 NLA_REPO = "ceselder/qwen3.6-27b-nla-rl"
 # The published AR was saved at RL step 600 (ar_reconstructor/saved_at_step.txt): resume the AV from the same step.
 NLA_ADAPTER = "av_rl_adapters/iter_000600"
