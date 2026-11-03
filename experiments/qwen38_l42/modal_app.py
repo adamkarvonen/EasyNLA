@@ -1,27 +1,13 @@
-"""Continue the RL of the Qwen3.6-27B NLA (ceselder/qwen3.6-27b-nla-rl, layer 42) on Qwen3.8-27B activations, on Modal.
+"""Modal app for the Qwen3.8-27B layer-42 NLA experiments (README.md here): continue the RL of the Qwen3.6-27B NLA
+(ceselder/qwen3.6-27b-nla-rl) on Qwen3.8 activations.
 
-The image installs THIS checkout of the repo (no git clone), so a run uses exactly the committed code: commit, then
-launch. Stages:
+The image installs THIS checkout of the repo, so a run uses exactly the committed code: commit, then launch.
 
-1. download: the NLA repo files + a 20k-doc FineFineWeb sample (equal share from each of its 67 domains).
-2. extract: stage0 (Qwen3.8 layer-42 activations, 10 positions/doc) -> stage1 split -> stage3 RL rows with the 3.6
-   NLA's own prompt templates -> shuffle. No stage2: RL rows need no explanations.
-3. rl: nla.train_rl_vllm resumed from the published AV adapter iter_000600 + the published AR (saved at RL step 600,
-   so the matched pair), with the 3.6 run's hyperparameters. One vLLM engine (TP 1) beside the trainer on each GPU;
-   N GPUs = N data-parallel ranks under torchrun. B200 only (actor + AR + engine ~178 GB per GPU).
-
-    set -a && . .env && set +a          # HF_TOKEN, WANDB_API_KEY
-    modal run scripts/modal_qwen38_rl.py::download
-    modal run scripts/modal_qwen38_rl.py::extract
-    NLA_GPUS=B200:8 modal run scripts/modal_qwen38_rl.py::rl --name q38_l42_rl --n-gpus 8 --num-steps 100 \
-        --batch-prompts 504 --eval-every 10 --eval-n-prompts 128 --save-every 25
-
-Resume an interrupted run from its last checkpoint (optimizer state and data cursor continue; the AR restarts from
-the run's critic_latest with a fresh LoRA, as EasyNLA's --ar-lora resume does):
-
-    NLA_GPUS=B200:4 modal run scripts/modal_qwen38_rl.py::rl --name <wandb name> --resume <run>/iter_000050 ...
-
-Modal names (app, volumes) carry the adam- prefix of the workspace this was run in; change APP/VOLUME names to reuse.
+- download, extract: the NLA repo files and 20k FineFineWeb docs -> Qwen3.8 layer-42 RL rows (once).
+- check_ar: CPU check that the published AR loads exactly.
+- rl: nla.train_rl_vllm from the published AV adapter iter_000600 and AR (saved at RL step 600, the matched pair),
+  with the 3.6 run's hyperparameters; one vLLM engine (TP 1) beside the trainer on each GPU, N GPUs = N data-parallel
+  ranks under torchrun. B200 only (actor + AR + engine ~178 GB per GPU). The arms in the subfolders are its flags.
 """
 
 import os
@@ -29,7 +15,7 @@ from pathlib import Path
 
 import modal
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 NLA_REPO = "ceselder/qwen3.6-27b-nla-rl"
 # The published AR was saved at RL step 600 (ar_reconstructor/saved_at_step.txt): resume the AV from the same step.
 NLA_ADAPTER = "av_rl_adapters/iter_000600"
@@ -162,23 +148,31 @@ def check_ar():
           f"{len(ours) - n - len(head)} other entries: {[k for k in ours if not k.startswith(('backbone.model.layers', 'value_head'))]}")
 
 
-# memory: (request, limit) in MiB. Each DP rank stages actor + AR through CPU RAM at load, so 8 ranks can burst past
-# the 512 GiB request.
-@app.function(gpu=os.environ.get("NLA_GPUS", "B200"), volumes=VOLS, timeout=24 * 3600, memory=(524288, 1048576),
+# memory: (request, limit) in MiB. Each DP rank stages actor + AR through CPU RAM at load, a burst past the request.
+@app.function(gpu=os.environ.get("NLA_GPUS", "B200"), volumes=VOLS, timeout=24 * 3600, memory=(262144, 1048576),
               secrets=[modal.Secret.from_local_environ(["WANDB_API_KEY", "HF_TOKEN"])])
-def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4, eval_every: int = 5,
-       eval_n_prompts: int = 64, rows: str = "/data/q38_L42_20k/rl_shuf.parquet", val_rows: int = 5000,
-       n_gpus: int = 1, save_every: int = 0, vllm_gpu_mem: float = 0.36, critic_micro_batch: int = 2,
-       wandb_project: str = "adam-nla-finetune", resume: str = "", init_lora: str = "", train_critic: bool = True,
-       extra: str = ""):
-    """nla.train_rl_vllm resumed from the 3.6 NLA. The 3.6 run's run_config.yaml hyperparameters, except, for memory on
-    B200: vllm gpu mem 0.36 (0.4), logp micro-batch 2 (8), critic micro-batch 2 (4). NLA_GPUS (read when the app is
-    built locally, e.g. B200:8) must match n_gpus."""
+def rl(name: str, n_gpus: int = 1, num_steps: int = 5, batch_prompts: int = 16, grad_accum: int = 1, lr: float = 1e-4,
+       eval_every: int = 5, eval_n_prompts: int = 64, save_every: int = 0, av_lora: str = "", ar: str = "",
+       train_actor: bool = True, train_critic: bool = True, eval_only: bool = False, resume: str = "",
+       rows: str = "/data/q38_L42_20k/rl_shuf.parquet", val_rows: int = 5000, vllm_gpu_mem: float = 0.36,
+       critic_micro_batch: int = 2, wandb_project: str = "adam-nla-finetune", extra: str = ""):
+    """One run of nla.train_rl_vllm. The 3.6 run's run_config.yaml hyperparameters, except, for memory on B200: vllm
+    gpu mem 0.36 (0.4), logp micro-batch 2 (8), critic micro-batch 2 (4). NLA_GPUS (read when the app is built
+    locally, e.g. B200:4) must match n_gpus. Paths are relative to /data/runs on the adam-nla-finetune volume:
+
+    - av_lora: start the AV from this adapter (e.g. q38_l42_rl100_4x/iter_000200) instead of the published one.
+    - ar: start (or score with) this AR (e.g. q38_l42_rl100_4x/critic_latest) instead of the published one.
+    - train_actor / train_critic: --no-train-actor fixes the AV, --no-train-critic fixes the AR.
+    - eval_only: score the AV under the AR on the eval set once (eval_n_prompts held-out prompts), no update.
+    - resume: continue an interrupted run from its own iter_* (optimizer state, data cursor and critic_latest).
+    """
     import shlex
+    import shutil
     import sys
 
     from huggingface_hub import snapshot_download
 
+    assert not (resume and (av_lora or ar)), "resume restores the run's own AV and AR"
     d = _nla_dir()
     vllm_model = snapshot_download(VLLM_MODEL)
     # Weight sync and the steer checks ship pickled callables from the trainer to its own engine in the same container
@@ -187,23 +181,25 @@ def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4,
     launch = ([sys.executable, "-m", "nla.train_rl_vllm"] if n_gpus == 1 else
               [sys.executable, "-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={n_gpus}",
                "-m", "nla.train_rl_vllm"])
-    # resume: continue an interrupted run from its own checkpoint (iter_* in its save dir: LoRA, optim_latest with the
-    # step, critic_latest); otherwise start from the published AV adapter.
-    resume_lora = f"/data/runs/{resume}" if resume else f"{d}/{NLA_ADAPTER}"
-    if init_lora:
-        # Start a FRESH run (step 0, published AR) from another run's adapter, e.g. to score a trained AV under the
-        # frozen starting AR (--train-critic off, --num-steps 1, eval at step 0). Copied out of its run dir: the
-        # trainer looks for optim_latest beside the LoRA and would otherwise resume that run's step.
-        import shutil
-        resume_lora = "/tmp/init_lora"
-        shutil.copytree(f"/data/runs/{init_lora}", resume_lora)
     save_dir = f"/data/runs/{resume.split('/')[0]}" if resume else f"/data/runs/{name}"
+    if resume:
+        lora = f"/data/runs/{resume}"
+    elif av_lora:
+        # Copied out of its run dir: the trainer looks for optim_latest beside the LoRA and would resume that run's step.
+        lora = "/tmp/av_lora"
+        shutil.copytree(f"/data/runs/{av_lora}", lora)
+    else:
+        lora = f"{d}/{NLA_ADAPTER}"
     _run([*launch,
-          "--av-ckpt", f"{d}/av_base", "--resume-from-lora", resume_lora,
-          "--ar-ckpt", f"{d}/ar_reconstructor", "--ar-lora", "--ar-lora-r", "64", "--ar-lora-alpha", "16",
-          "--train-critic" if train_critic else "--no-train-critic", "--rl-parquet", rows, "--sidecar", rows, "--save-dir", save_dir,
-          "--num-steps", str(num_steps), "--batch-prompts", str(batch_prompts), "--group-size", "8",
-          "--max-new-tokens", "256", "--temperature", "1.0", "--lr", str(lr), "--critic-lr", "8e-5",
+          "--av-ckpt", f"{d}/av_base", "--resume-from-lora", lora,
+          "--ar-ckpt", f"/data/runs/{ar}" if ar else f"{d}/ar_reconstructor",
+          "--ar-lora", "--ar-lora-r", "64", "--ar-lora-alpha", "16",
+          "--train-actor" if train_actor else "--no-train-actor",
+          "--train-critic" if train_critic else "--no-train-critic",
+          *(["--eval-only"] if eval_only else []),
+          "--rl-parquet", rows, "--sidecar", rows, "--save-dir", save_dir,
+          "--num-steps", str(num_steps), "--batch-prompts", str(batch_prompts), "--grad-accum", str(grad_accum),
+          "--group-size", "8", "--max-new-tokens", "256", "--temperature", "1.0", "--lr", str(lr), "--critic-lr", "8e-5",
           "--lora-r", "64", "--lora-alpha", "16", "--kl-beta", "0.01", "--kl-estimator", "k3",
           "--length-penalty", "0.01", "--length-threshold", "192",
           "--logp-micro-batch", "2", "--gradient-checkpointing", "--critic-micro-batch", str(critic_micro_batch),

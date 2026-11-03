@@ -1026,6 +1026,11 @@ def main():
                         "--no-train-critic to disable). Adds a separate optimizer for "
                         "the critic and supervised MSE loss on (explanation, "
                         "gold_activation) pairs each step.")
+    p.add_argument("--train-actor", action=argparse.BooleanOptionalAction, default=True,
+                   help="Update the AV (default ON). --no-train-actor keeps the AV fixed and "
+                        "trains only the critic on the fixed AV's on-policy samples.")
+    p.add_argument("--eval-only", action="store_true", default=False,
+                   help="Load the AV and AR, run the held-out eval once, exit (no update).")
     p.add_argument("--critic-lr", type=float, default=8e-5)
     p.add_argument("--dr-grpo", action="store_true", default=False,
                    help="Dr. GRPO: drop the two normalizations that bias vanilla "
@@ -1190,6 +1195,10 @@ def main():
     args = p.parse_args()
 
     # ---- fail-fast checks (BEFORE any model/engine loading) ----
+    if not (args.eval_only or args.train_actor or args.train_critic):
+        raise SystemExit("--no-train-actor with --no-train-critic trains nothing; use --eval-only")
+    if args.eval_only and not (args.eval_every > 0 and args.eval_n_prompts > 0):
+        raise SystemExit("--eval-only needs --eval-every > 0 and --eval-n-prompts > 0 (they load the eval set)")
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     # Refuse to silently overwrite an existing run: iter_* checkpoints present
@@ -1848,6 +1857,172 @@ def main():
               f"(cursor={cursor})", flush=True)
 
     prev_preemptions = 0  # cumulative vLLM preemptions seen at last step (KV thrash tracker)
+    # ---- held-out eval: run the actor (current weights) on a FIXED set of held-out
+    # prompts, score under the live critic, log explanations as a wandb Table.
+    # Lets you scrub through the run and watch explanations evolve. Runs after
+    # the step's update, so eval@N sees the weights after batch N (with
+    # --grad-accum k, evals at multiples of k see the weights before it).
+    def run_eval(step, log):
+        actor.eval()
+        _t_eval_fve = time.time()   # [timing] base_fve = vLLM gen + critic scoring
+        eval_rewards_s = []
+        eval_records = []
+        # --- Phase 1: vLLM batched generation. Reuses the training rollout
+        # path (rollout_batch_vllm, group_size=1) -> ~30s for n=128 vs ~8min
+        # sequential HF. The eval reflects the vLLM ROLLOUT policy, which is
+        # re-synced to the trainer after every step, so it IS the current
+        # policy. Bonus: eval
+        # shares the training injection path, so eval/train agree (kills the
+        # separate HF-injection quirk that made eval@0 read negative).
+        _eval_prompts_with_acts = [
+            (build_prompt_text(r["prompt"], inject_char, tokenizer),
+             torch.tensor(r["activation"], dtype=torch.float32))
+            for r in eval_rows
+        ]
+        _eval_temp = args.eval_temperature if args.eval_temperature is not None else args.temperature
+        _eval_responses = rollout_batch_vllm(
+            llm, tokenizer, _eval_prompts_with_acts,
+            inj_id, 1, args.max_new_tokens, _eval_temp,  # group_size=1
+            left_id=left_id, right_id=right_id,
+        )
+        # rollout_batch_vllm may return responses in any order; key each by
+        # the prompt index it stamps (group_size=1 -> exactly one per prompt).
+        _resp_by_idx = {r["prompt_idx"]: r["text"] for r in _eval_responses}
+        # --- Phase 2: scoring (per-row, reads the pre-generated responses).
+        # Run TWICE when EMA is on -- same generations, live vs EMA critic --
+        # so the arms are compared on scorer quality, not on sampling noise.
+        _eval_expls = [extract_explanation(_resp_by_idx.get(ei, ""))
+                       for ei in range(len(eval_rows))]
+
+        def _score_eval_rows():
+            """Reward per eval row under whatever critic weights are live now."""
+            out = []
+            for ei in range(len(eval_rows)):
+                activation = _eval_prompts_with_acts[ei][1]
+                expl = _eval_expls[ei]
+                e_reward = -2.0
+                if expl is not None:
+                    ctext = template.format(explanation=expl)
+                    cids = tokenizer.encode(ctext, add_special_tokens=False)
+                    if 0 < len(cids) <= 1024:
+                        x = torch.tensor([cids], dtype=torch.long, device=device)
+                        with torch.no_grad():
+                            pred = critic_predict(critic, x, None, mse_scale_f)[0]
+                        gold = activation.to(device).float()
+                        pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
+                        gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
+                        mse = F.mse_loss(pn, gn).item()
+                        if math.isfinite(mse):
+                            e_reward = -mse
+                out.append(e_reward)
+            return out
+
+        eval_rewards_s = _score_eval_rows()          # live critic (canonical)
+        eval_rewards_ema = None
+        if critic_ema.enabled:
+            with critic_ema.swapped():
+                eval_rewards_ema = _score_eval_rows()
+        for ei in range(len(eval_rows)):
+            expl, e_reward = _eval_expls[ei], eval_rewards_s[ei]
+            eval_records.append({
+                "step": step, "idx": ei, "reward": e_reward,
+                "fve": (1.0 - (-e_reward) / eval_fve_baseline) if e_reward > -2.0 else float("nan"),
+                "extracted": expl is not None,
+                "explanation": expl if expl is not None else "<extraction failed>",
+            })
+        # Aggregate eval scalars
+        valid_e = [r for r in eval_rewards_s if r > -2.0]
+        log["eval/reward_mean"] = (
+            float(np.mean(eval_rewards_s)) if eval_rewards_s else float("nan")
+        )
+        log["eval/reward_mean_valid"] = (
+            float(np.mean(valid_e)) if valid_e else float("nan")
+        )
+        log["eval/fve_pct"] = (
+            (1.0 - (-float(np.mean(valid_e))) / eval_fve_baseline) * 100.0
+            if valid_e else float("nan")
+        )
+        if eval_rewards_ema is not None:
+            _valid_ema = [r for r in eval_rewards_ema if r > -2.0]
+            log["eval/fve_pct_ema"] = (
+                (1.0 - (-float(np.mean(_valid_ema))) / eval_fve_baseline) * 100.0
+                if _valid_ema else float("nan")
+            )
+            log["eval/reward_mean_ema"] = float(np.mean(eval_rewards_ema))
+        log["eval/extraction_rate"] = (
+            sum(1 for r in eval_records if r["extracted"]) / len(eval_records)
+            if eval_records else 0.0
+        )
+        log["time/eval_base_fve_s"] = time.time() - _t_eval_fve  # FVE eval cost (gen+scoring)
+        # Persistent table — accumulates across the whole run.
+        for r in eval_records:
+            eval_table_data.append([
+                r["step"], r["idx"], r["reward"], r["fve"],
+                r["extracted"], r["explanation"][:500],
+            ])
+        if not args.no_wandb:
+            log["eval/samples"] = wandb.Table(
+                columns=["step", "idx", "reward", "fve", "extracted", "explanation"],
+                data=list(eval_table_data),
+            )
+        print(
+            f"  [eval@{step}] reward {log['eval/reward_mean']:.3f} "
+            f"| FVE {log['eval/fve_pct']:.1f}% "
+            f"| ext {log['eval/extraction_rate']:.0%}"
+            + (f" | FVE(ema) {log['eval/fve_pct_ema']:.1f}%"
+               if eval_rewards_ema is not None else ""),
+            flush=True,
+        )
+        # ---- Opus text-attribute judges (opt-in; reuses THIS round's
+        # generations — see nla/utils/text_judges.py) ----
+        if "text_judges" in args.evals and step % args.text_judges_every == 0:
+            from nla.utils.text_judges import (
+                RUBRIC_PROMPTS, SOURCE_RUBRIC_PROMPTS, judge_explanations)
+            _t_tj = time.time()
+            _tj_expl = [r["explanation"] if r["extracted"] else None
+                        for r in eval_records]
+            _tj_src = [row.get("source", "") for row in eval_rows]
+            _judge_kw = ({"model": args.judge_model}
+                         if args.judge_model else {})
+            tj_metrics, _ = judge_explanations(
+                _tj_expl, _tj_src, seed=args.seed,
+                concurrency=args.judge_concurrency, **_judge_kw)
+            log.update({f"eval_judge/{k}": v for k, v in tj_metrics.items()})
+            log["time/eval_text_judges_s"] = time.time() - _t_tj
+            print(
+                f"  [text_judges@{step}] "
+                + " ".join(f"{d} {tj_metrics[d + '_mean']:.2f}"
+                           for d in (*RUBRIC_PROMPTS, *SOURCE_RUBRIC_PROMPTS))
+                + f" | match {tj_metrics['source_match_acc']:.0%}"
+                f" | judge_fail {tj_metrics['judge_fail_rate']:.0%}"
+                f" | {log['time/eval_text_judges_s']:.0f}s",
+                flush=True,
+            )
+        # Print 3 sample explanations so the log itself shows how outputs
+        # evolve. Pick indices 0, 7, 14 — spread across the eval set.
+        for _ei in (0, 7, 14):
+            if _ei < len(eval_records):
+                _r = eval_records[_ei]
+                _expl = _r["explanation"][:200].replace("\n", " ")
+                print(
+                    f"    [eval@{step} idx={_ei} r={_r['reward']:.3f}] {_expl}",
+                    flush=True,
+                )
+
+    # --eval-only: score the loaded AV under the loaded AR on the held-out eval
+    # set once, with no update (e.g. to cross an AV with another run's AR).
+    if args.eval_only:
+        if is_main:
+            log = {}
+            run_eval(args.start_step, log)
+            if not args.no_wandb:
+                wandb.log(log, step=args.start_step)
+                wandb.finish()
+        if is_dist:
+            dist.destroy_process_group()
+        print("done.")
+        return
+
     for step in range(args.start_step, args.num_steps):
         t0 = time.time()
         # ---- batch select ----
@@ -2093,22 +2268,25 @@ def main():
         upd_activations = [all_activations[i] for i in keep]
         upd_old_logps = [all_old_logps[i] for i in keep]
         upd_adv = adv.index_select(0, torch.tensor(keep, device=device))
-        actor.train()
-        mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
-            actor, optim, tokenizer,
-            upd_full_ids, upd_prompt_lens, upd_activations,
-            upd_adv, vectors_ref, device,
-            micro_batch=args.logp_micro_batch,
-            kl_beta=args.kl_beta,
-            max_grad_norm=args.max_grad_norm,
-            zero_grad_first=is_accum_start, do_step=is_accum_end,
-            loss_scale=1.0 / accum, dp_world_size=world_size,
-            kl_estimator=args.kl_estimator, kl_topk=args.kl_topk,
-            n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
-            length_normalizer=(args.max_new_tokens if args.dr_grpo else None),
-            old_logps_list=upd_old_logps,
-            sampler_mismatch_thresh=args.sampler_mismatch_thresh,
-        )
+        if args.train_actor:
+            actor.train()
+            mean_loss_val, grad_norm_val, grpo_metrics = grpo_update_microbatched(
+                actor, optim, tokenizer,
+                upd_full_ids, upd_prompt_lens, upd_activations,
+                upd_adv, vectors_ref, device,
+                micro_batch=args.logp_micro_batch,
+                kl_beta=args.kl_beta,
+                max_grad_norm=args.max_grad_norm,
+                zero_grad_first=is_accum_start, do_step=is_accum_end,
+                loss_scale=1.0 / accum, dp_world_size=world_size,
+                kl_estimator=args.kl_estimator, kl_topk=args.kl_topk,
+                n_total=len(inject_ok),   # fixed budget: dropped rollouts act as zeros
+                length_normalizer=(args.max_new_tokens if args.dr_grpo else None),
+                old_logps_list=upd_old_logps,
+                sampler_mismatch_thresh=args.sampler_mismatch_thresh,
+            )
+        else:   # --no-train-actor: the AV stays fixed, nothing to update or sync
+            mean_loss_val, grad_norm_val, grpo_metrics = 0.0, 0.0, {}
         t_grpo_end = time.time()  # [timing] end of GRPO forward+backward+step
         # Build a scalar-tensor stand-in for the existing logging path that
         # expects a `loss` tensor with .item().
@@ -2137,7 +2315,7 @@ def main():
         # the weights are byte-identical, so syncing would push ~16GB for
         # nothing (at grad_accum=4 that's 3 wasted syncs per real update). ----
         vllm_sync_secs = 0.0
-        if is_accum_end:
+        if is_accum_end and args.train_actor:
             vllm_sync_secs = sync_actor_to_vllm(actor, llm, ipc=args.ipc_weight_sync,
                                                 name_map=args.vllm_name_map)
             print(f"  [vllm sync@{step+1}] {vllm_sync_secs:.1f}s", flush=True)
@@ -2366,155 +2544,8 @@ def main():
                 flush=True,
             )
 
-        # ---- per-step eval: every N steps, run actor (current weights) on a
-        # FIXED set of held-out prompts and log explanations as a wandb Table.
-        # Lets you scrub through the run and watch explanations evolve.
         if is_main and args.eval_every > 0 and step % args.eval_every == 0:
-            actor.eval()
-            _t_eval_fve = time.time()   # [timing] base_fve = vLLM gen + critic scoring
-            eval_rewards_s = []
-            eval_records = []
-            # --- Phase 1: vLLM batched generation. Reuses the training rollout
-            # path (rollout_batch_vllm, group_size=1) -> ~30s for n=128 vs ~8min
-            # sequential HF. The eval reflects the vLLM ROLLOUT policy, which is
-            # re-synced to the trainer after every step, so it IS the current
-            # policy. Bonus: eval
-            # shares the training injection path, so eval/train agree (kills the
-            # separate HF-injection quirk that made eval@0 read negative).
-            _eval_prompts_with_acts = [
-                (build_prompt_text(r["prompt"], inject_char, tokenizer),
-                 torch.tensor(r["activation"], dtype=torch.float32))
-                for r in eval_rows
-            ]
-            _eval_temp = args.eval_temperature if args.eval_temperature is not None else args.temperature
-            _eval_responses = rollout_batch_vllm(
-                llm, tokenizer, _eval_prompts_with_acts,
-                inj_id, 1, args.max_new_tokens, _eval_temp,  # group_size=1
-                left_id=left_id, right_id=right_id,
-            )
-            # rollout_batch_vllm may return responses in any order; key each by
-            # the prompt index it stamps (group_size=1 -> exactly one per prompt).
-            _resp_by_idx = {r["prompt_idx"]: r["text"] for r in _eval_responses}
-            # --- Phase 2: scoring (per-row, reads the pre-generated responses).
-            # Run TWICE when EMA is on -- same generations, live vs EMA critic --
-            # so the arms are compared on scorer quality, not on sampling noise.
-            _eval_expls = [extract_explanation(_resp_by_idx.get(ei, ""))
-                           for ei in range(len(eval_rows))]
-
-            def _score_eval_rows():
-                """Reward per eval row under whatever critic weights are live now."""
-                out = []
-                for ei in range(len(eval_rows)):
-                    activation = _eval_prompts_with_acts[ei][1]
-                    expl = _eval_expls[ei]
-                    e_reward = -2.0
-                    if expl is not None:
-                        ctext = template.format(explanation=expl)
-                        cids = tokenizer.encode(ctext, add_special_tokens=False)
-                        if 0 < len(cids) <= 1024:
-                            x = torch.tensor([cids], dtype=torch.long, device=device)
-                            with torch.no_grad():
-                                pred = critic_predict(critic, x, None, mse_scale_f)[0]
-                            gold = activation.to(device).float()
-                            pn = normalize_activation(pred.unsqueeze(0), mse_scale_f)[0]
-                            gn = normalize_activation(gold.unsqueeze(0), mse_scale_f)[0]
-                            mse = F.mse_loss(pn, gn).item()
-                            if math.isfinite(mse):
-                                e_reward = -mse
-                    out.append(e_reward)
-                return out
-
-            eval_rewards_s = _score_eval_rows()          # live critic (canonical)
-            eval_rewards_ema = None
-            if critic_ema.enabled:
-                with critic_ema.swapped():
-                    eval_rewards_ema = _score_eval_rows()
-            for ei in range(len(eval_rows)):
-                expl, e_reward = _eval_expls[ei], eval_rewards_s[ei]
-                eval_records.append({
-                    "step": step, "idx": ei, "reward": e_reward,
-                    "fve": (1.0 - (-e_reward) / eval_fve_baseline) if e_reward > -2.0 else float("nan"),
-                    "extracted": expl is not None,
-                    "explanation": expl if expl is not None else "<extraction failed>",
-                })
-            # Aggregate eval scalars
-            valid_e = [r for r in eval_rewards_s if r > -2.0]
-            log["eval/reward_mean"] = (
-                float(np.mean(eval_rewards_s)) if eval_rewards_s else float("nan")
-            )
-            log["eval/reward_mean_valid"] = (
-                float(np.mean(valid_e)) if valid_e else float("nan")
-            )
-            log["eval/fve_pct"] = (
-                (1.0 - (-float(np.mean(valid_e))) / eval_fve_baseline) * 100.0
-                if valid_e else float("nan")
-            )
-            if eval_rewards_ema is not None:
-                _valid_ema = [r for r in eval_rewards_ema if r > -2.0]
-                log["eval/fve_pct_ema"] = (
-                    (1.0 - (-float(np.mean(_valid_ema))) / eval_fve_baseline) * 100.0
-                    if _valid_ema else float("nan")
-                )
-                log["eval/reward_mean_ema"] = float(np.mean(eval_rewards_ema))
-            log["eval/extraction_rate"] = (
-                sum(1 for r in eval_records if r["extracted"]) / len(eval_records)
-                if eval_records else 0.0
-            )
-            log["time/eval_base_fve_s"] = time.time() - _t_eval_fve  # FVE eval cost (gen+scoring)
-            # Persistent table — accumulates across the whole run.
-            for r in eval_records:
-                eval_table_data.append([
-                    r["step"], r["idx"], r["reward"], r["fve"],
-                    r["extracted"], r["explanation"][:500],
-                ])
-            if not args.no_wandb:
-                log["eval/samples"] = wandb.Table(
-                    columns=["step", "idx", "reward", "fve", "extracted", "explanation"],
-                    data=list(eval_table_data),
-                )
-            print(
-                f"  [eval@{step}] reward {log['eval/reward_mean']:.3f} "
-                f"| FVE {log['eval/fve_pct']:.1f}% "
-                f"| ext {log['eval/extraction_rate']:.0%}"
-                + (f" | FVE(ema) {log['eval/fve_pct_ema']:.1f}%"
-                   if eval_rewards_ema is not None else ""),
-                flush=True,
-            )
-            # ---- Opus text-attribute judges (opt-in; reuses THIS round's
-            # generations — see nla/utils/text_judges.py) ----
-            if "text_judges" in args.evals and step % args.text_judges_every == 0:
-                from nla.utils.text_judges import (
-                    RUBRIC_PROMPTS, SOURCE_RUBRIC_PROMPTS, judge_explanations)
-                _t_tj = time.time()
-                _tj_expl = [r["explanation"] if r["extracted"] else None
-                            for r in eval_records]
-                _tj_src = [row.get("source", "") for row in eval_rows]
-                _judge_kw = ({"model": args.judge_model}
-                             if args.judge_model else {})
-                tj_metrics, _ = judge_explanations(
-                    _tj_expl, _tj_src, seed=args.seed,
-                    concurrency=args.judge_concurrency, **_judge_kw)
-                log.update({f"eval_judge/{k}": v for k, v in tj_metrics.items()})
-                log["time/eval_text_judges_s"] = time.time() - _t_tj
-                print(
-                    f"  [text_judges@{step}] "
-                    + " ".join(f"{d} {tj_metrics[d + '_mean']:.2f}"
-                               for d in (*RUBRIC_PROMPTS, *SOURCE_RUBRIC_PROMPTS))
-                    + f" | match {tj_metrics['source_match_acc']:.0%}"
-                    f" | judge_fail {tj_metrics['judge_fail_rate']:.0%}"
-                    f" | {log['time/eval_text_judges_s']:.0f}s",
-                    flush=True,
-                )
-            # Print 3 sample explanations so the log itself shows how outputs
-            # evolve. Pick indices 0, 7, 14 — spread across the eval set.
-            for _ei in (0, 7, 14):
-                if _ei < len(eval_records):
-                    _r = eval_records[_ei]
-                    _expl = _r["explanation"][:200].replace("\n", " ")
-                    print(
-                        f"    [eval@{step} idx={_ei} r={_r['reward']:.3f}] {_expl}",
-                        flush=True,
-                    )
+            run_eval(step, log)
 
         if is_main and not args.no_wandb:
             wandb.log(log, step=step)   # rank0 logs its shard's per-step metrics;
