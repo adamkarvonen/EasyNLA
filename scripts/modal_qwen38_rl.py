@@ -169,7 +169,8 @@ def check_ar():
 def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4, eval_every: int = 5,
        eval_n_prompts: int = 64, rows: str = "/data/q38_L42_20k/rl_shuf.parquet", val_rows: int = 5000,
        n_gpus: int = 1, save_every: int = 0, vllm_gpu_mem: float = 0.36, critic_micro_batch: int = 2,
-       wandb_project: str = "adam-nla-finetune", resume: str = "", extra: str = ""):
+       wandb_project: str = "adam-nla-finetune", resume: str = "", init_lora: str = "", train_critic: bool = True,
+       extra: str = ""):
     """nla.train_rl_vllm resumed from the 3.6 NLA. The 3.6 run's run_config.yaml hyperparameters, except, for memory on
     B200: vllm gpu mem 0.36 (0.4), logp micro-batch 2 (8), critic micro-batch 2 (4). NLA_GPUS (read when the app is
     built locally, e.g. B200:8) must match n_gpus."""
@@ -189,11 +190,18 @@ def rl(name: str, num_steps: int = 5, batch_prompts: int = 16, lr: float = 1e-4,
     # resume: continue an interrupted run from its own checkpoint (iter_* in its save dir: LoRA, optim_latest with the
     # step, critic_latest); otherwise start from the published AV adapter.
     resume_lora = f"/data/runs/{resume}" if resume else f"{d}/{NLA_ADAPTER}"
+    if init_lora:
+        # Start a FRESH run (step 0, published AR) from another run's adapter, e.g. to score a trained AV under the
+        # frozen starting AR (--train-critic off, --num-steps 1, eval at step 0). Copied out of its run dir: the
+        # trainer looks for optim_latest beside the LoRA and would otherwise resume that run's step.
+        import shutil
+        resume_lora = "/tmp/init_lora"
+        shutil.copytree(f"/data/runs/{init_lora}", resume_lora)
     save_dir = f"/data/runs/{resume.split('/')[0]}" if resume else f"/data/runs/{name}"
     _run([*launch,
           "--av-ckpt", f"{d}/av_base", "--resume-from-lora", resume_lora,
           "--ar-ckpt", f"{d}/ar_reconstructor", "--ar-lora", "--ar-lora-r", "64", "--ar-lora-alpha", "16",
-          "--train-critic", "--rl-parquet", rows, "--sidecar", rows, "--save-dir", save_dir,
+          *(["--train-critic"] if train_critic else []), "--rl-parquet", rows, "--sidecar", rows, "--save-dir", save_dir,
           "--num-steps", str(num_steps), "--batch-prompts", str(batch_prompts), "--group-size", "8",
           "--max-new-tokens", "256", "--temperature", "1.0", "--lr", str(lr), "--critic-lr", "8e-5",
           "--lora-r", "64", "--lora-alpha", "16", "--kl-beta", "0.01", "--kl-estimator", "k3",
