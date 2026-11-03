@@ -44,6 +44,19 @@ first save (batch 50, allocator fragmentation, 180 MB short) and was resumed fro
 (cache release after eval/save, vLLM memory 0.38 -> 0.36). ~354 s/batch before the fix, ~420-490 s after.
 Final: `runs/q38_l42_rl100_4x/iter_000200` (AV) and `critic_latest` (AR, step 200).
 
-### av_only, ar_only, swap_evals
+### swap_evals (cotrain)
 
-Pending.
+Held-out FVE (%) on 512 prompts (eval-set baseline MSE 0.4414), `--eval-only`, commit `c3edbc3`:
+
+| AV \ AR | published (start) | cotrain final (step 100) |
+|---|---|---|
+| published (start) | 65.1 | 69.0 |
+| cotrain final (step 100) | 65.2 | 69.6 |
+
+The cotrain gain is almost all the AR's: the trained AR adds 3.9-4.4 points under either AV, and the trained AV adds
+0.1-0.6 under either AR. The AV differences are within the noise of single-sample evals on 512 prompts (roughly
++-0.6 for a difference, estimated, not measured).
+
+### av_only, ar_only
+
+Running.
