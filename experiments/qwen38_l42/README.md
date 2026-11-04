@@ -44,14 +44,15 @@ first save (batch 50, allocator fragmentation, 180 MB short) and was resumed fro
 (cache release after eval/save, vLLM memory 0.38 -> 0.36). ~354 s/batch before the fix, ~420-490 s after.
 Final: `runs/q38_l42_rl100_4x/iter_000200` (AV) and `critic_latest` (AR, step 200).
 
-### swap_evals (cotrain)
+### swap_evals
 
 Held-out FVE (%) on 512 prompts (eval-set baseline MSE 0.4414), `--eval-only`, commit `c3edbc3`:
 
-| AV \ AR | published (start) | cotrain final (step 100) |
-|---|---|---|
-| published (start) | 65.1 | 69.0 |
-| cotrain final (step 100) | 65.2 | 69.6 |
+| AV \ AR | published (start) | cotrain final (step 100) | ar_only final (step 20) |
+|---|---|---|---|
+| published (start) | 65.1 | 69.0 | 68.1 |
+| cotrain final (step 100) | 65.2 | 69.6 | 68.2 |
+| av_only final (step 20) | 65.1 | 68.6 | 67.3 |
 
 The cotrain gain is almost all the AR's: the trained AR adds 3.9-4.4 points under either AV, and the trained AV adds
 0.1-0.6 under either AR. The AV differences are within the noise of single-sample evals on 512 prompts (roughly
@@ -64,6 +65,16 @@ Its final AR (step 20) on the 512-prompt swap set: 68.1% under the published AV,
 +3.0 points over the published AR in 20 steps, against +3.9-4.4 for the cotrain AR in 100. Training the AR alone tracks
 co-training step for step. ~176 s/batch (no policy update or weight sync).
 
-### av_only
+### av_only (`q38_l42_av_only`)
 
-Running.
+Held-out FVE (128 prompts) by optimizer step, AR fixed at the published one: 0: 66.0, 5: 65.5, 10: 66.4, 15: 66.2%.
+KL to the start 0.76-0.80, parse rate 99-100%. ~360-420 s/batch. Its final AV (step 20) on the 512-prompt swap set:
+65.1% under the published AR, the same as the published AV; 68.6 and 67.3% under the two trained ARs, 0.4-0.8 below
+the published AV. RL on the AV alone doesn't improve FVE in 20 steps. The small deficit under the trained ARs is
+consistent with those ARs having been fit to the published AV's outputs, and is near the eval noise.
+
+## Conclusion
+
+On Qwen3.8 the adaptation is the AR's: training it alone or with the AV gains 3-4.5 FVE points over the published
+pair; the AV gains nothing measurable whether trained alone (20 steps) or with the AR (100 steps). For a Qwen3.8 NLA,
+use the published AV with the cotrain AR (`q38_l42_rl100_4x/critic_latest`, 69.0%) or the cotrain pair (69.6%).
