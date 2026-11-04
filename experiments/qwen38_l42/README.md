@@ -57,6 +57,13 @@ The cotrain gain is almost all the AR's: the trained AR adds 3.9-4.4 points unde
 0.1-0.6 under either AR. The AV differences are within the noise of single-sample evals on 512 prompts (roughly
 +-0.6 for a difference, estimated, not measured).
 
-### av_only, ar_only
+### ar_only (`q38_l42_ar_only`)
+
+Held-out FVE (128 prompts) by optimizer step: 0: 66.6, 5: 68.8, 10: 68.8, 15: 69.3% (cotrain: 68.6 at 10, 69.7 at 20).
+Its final AR (step 20) on the 512-prompt swap set: 68.1% under the published AV, 68.2% under the cotrain final AV:
++3.0 points over the published AR in 20 steps, against +3.9-4.4 for the cotrain AR in 100. Training the AR alone tracks
+co-training step for step. ~176 s/batch (no policy update or weight sync).
+
+### av_only
 
 Running.
