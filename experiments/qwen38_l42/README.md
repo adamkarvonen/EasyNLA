@@ -12,6 +12,14 @@ is the exact launch command.
 | `ar_only/` | fixed (published) | trained | how much of `cotrain/` is the AR adapting? |
 | `swap_evals/` | - | - | each final AV scored under each AR (`--eval-only`) |
 
+Also here:
+- `FINDINGS.md`: the short write-up (fine-tuning barely matters, and the gain is the AR's).
+- `inference.py`: text -> activation -> explanation -> reconstruction.
+- `MODEL_CARD.md`: the card of the released pair,
+  [adamkarvonen/qwen3.8-27b-nla-L42](https://huggingface.co/adamkarvonen/qwen3.8-27b-nla-L42). It is published by
+  `modal_app.py::release_check` (stage and test) and `::release_upload`.
+- `BRINGUP.md`: the bring-up log (shims, thinking-prompt bug, smoke runs), moved from motivated-reasoning.
+
 ## Setup
 
 - **Data** (`modal_app.py::download`, `::extract`): 20k FineFineWeb docs (equal share of its 67 domains, the 3.6 NLA's
@@ -75,6 +83,5 @@ consistent with those ARs having been fit to the published AV's outputs, and is 
 
 ## Conclusion
 
-On Qwen3.8 the adaptation is the AR's: training it alone or with the AV gains 3-4.5 FVE points over the published
-pair; the AV gains nothing measurable whether trained alone (20 steps) or with the AR (100 steps). For a Qwen3.8 NLA,
-use the published AV with the cotrain AR (`q38_l42_rl100_4x/critic_latest`, 69.0%) or the cotrain pair (69.6%).
+See FINDINGS.md. In short: the gain is all the AR's, and the AV doesn't improve whether trained alone or with the AR.
+Modal cost: $984 in all, of which $730 is the cotrain run (breakdown in MODEL_CARD.md).

@@ -210,3 +210,79 @@ def rl(name: str, n_gpus: int = 1, num_steps: int = 5, batch_prompts: int = 16, 
           "--save-every", str(save_every or max(num_steps, 1)), "--wandb-project", wandb_project, "--wandb-name", name,
           *shlex.split(extra)])
     data.commit()
+
+
+RELEASE = "/data/release/qwen3.8-27b-nla-L42"
+
+
+@app.function(gpu="H200", volumes=VOLS, timeout=3 * 3600, memory=196608)
+def release_check(av: str = "q38_l42_rl100_4x/iter_000200", ar: str = "q38_l42_rl100_4x/critic_latest",
+                  n: int = 64, val_rows: int = 5000):
+    """Stage the release dir (AV adapter, AR, nla_meta.yaml) and run inference.py's code on it: the AV prompt equals
+    the training rows', re-extracted activations equal the stored ones, and the held-out FVE (n eval prompts, one
+    sample each) is in line with the in-run evals."""
+    import shutil
+    import sys
+
+    import numpy as np
+    import pyarrow.parquet as pq
+    import torch
+
+    sys.path.insert(0, "/opt/EasyNLA/experiments/qwen38_l42")
+    import inference as inf
+    from nla.schema import compute_predict_mean_baselines, resolve_target_scale
+    from nla.val_split import is_val_doc, val_doc_permille
+
+    rows_path = "/data/q38_L42_20k/rl_shuf.parquet"
+    shutil.rmtree(RELEASE, ignore_errors=True)
+    shutil.copytree(f"/data/runs/{av}", f"{RELEASE}/av_adapter", ignore=shutil.ignore_patterns("README.md", "optim*"))
+    shutil.copytree(f"/data/runs/{ar}", f"{RELEASE}/ar_reconstructor")
+    shutil.copy(f"{rows_path}.nla_meta.yaml", f"{RELEASE}/nla_meta.yaml")
+    data.commit()
+
+    # The trainers' eval set: the first n rows of held-out docs.
+    pf = pq.ParquetFile(rows_path)
+    permille = val_doc_permille(val_rows, pf.metadata.num_rows)
+    rows = []
+    for g in range(pf.num_row_groups):
+        t = pf.read_row_group(g, columns=["prompt", "activation_vector", "doc_id", "detokenized_text_truncated"])
+        rows += [r for r in t.to_pylist() if is_val_doc(r["doc_id"], permille)]
+        if len(rows) >= n:
+            break
+    rows = rows[:n]
+    gold = [torch.tensor(np.asarray(r["activation_vector"], dtype=np.float32)) for r in rows]
+
+    extracted, _ = inf.extract([r["detokenized_text_truncated"] for r in rows[:16]])
+    cos = [torch.nn.functional.cosine_similarity(a[-1], g, dim=0).item() for (a, _), g in zip(extracted, gold)]
+    print(f"re-extracted vs stored activation (last token, 16 rows): cosine min {min(cos):.4f}, mean {np.mean(cos):.4f}")
+
+    samples, cfg, tok = inf.verbalize(gold, RELEASE, _nla_dir())
+    from nla.utils import build_prompt_text
+    msgs = [{"role": "user", "content": cfg.actor_prompt_template.replace("{injection_char}", "<INJECT>")}]
+    assert all(build_prompt_text(r["prompt"], cfg.injection_char, tok) == build_prompt_text(msgs, cfg.injection_char, tok)
+               for r in rows), "inference prompt differs from the training rows'"
+    expls = [s[0][1] for s in samples]
+    ok = [i for i, e in enumerate(expls) if e is not None]
+    preds, scale = inf.reconstruct([expls[i] for i in ok], RELEASE, cfg, tok)
+    _, base = compute_predict_mean_baselines(torch.stack(gold), resolve_target_scale(cfg.mse_scale, cfg.d_model))
+    f = [inf.fve(p, gold[i], scale, baseline=base) for p, i in zip(preds, ok)]
+    print(f"parsed {len(ok)}/{n}; held-out FVE {100 * np.mean(f):.1f}% (eval-set baseline {base:.4f})")
+    for i in ok[:3]:
+        print(f"\n[{i}] ...{rows[i]['detokenized_text_truncated'][-200:]!r}\n -> {expls[i]}")
+
+
+@app.function(volumes=VOLS, timeout=4 * 3600, memory=32768, secrets=[modal.Secret.from_local_environ(["HF_TOKEN"])])
+def release_upload(repo: str = "adamkarvonen/qwen3.8-27b-nla-L42", private: bool = True):
+    """Upload the staged release dir plus MODEL_CARD.md (as README.md) and inference.py to the Hub."""
+    import shutil
+
+    from huggingface_hub import HfApi
+
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    here = "/opt/EasyNLA/experiments/qwen38_l42"
+    shutil.copy(f"{here}/MODEL_CARD.md", f"{RELEASE}/README.md")
+    shutil.copy(f"{here}/inference.py", f"{RELEASE}/inference.py")
+    api = HfApi()
+    api.create_repo(repo, private=private, exist_ok=True)
+    api.upload_folder(repo_id=repo, folder_path=RELEASE, commit_message="Qwen3.8-27B layer-42 NLA (cotrain final)")
+    print(api.list_repo_files(repo))
