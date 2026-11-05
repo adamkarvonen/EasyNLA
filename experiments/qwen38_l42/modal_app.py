@@ -276,9 +276,10 @@ def release_upload(repo: str = "adamkarvonen/qwen3.8-27b-nla-L42", private: bool
     """Upload the staged release dir plus MODEL_CARD.md (as README.md) and inference.py to the Hub."""
     import shutil
 
+    import huggingface_hub.constants
     from huggingface_hub import HfApi
 
-    os.environ["HF_HUB_OFFLINE"] = "0"
+    huggingface_hub.constants.HF_HUB_OFFLINE = False  # the image sets HF_HUB_OFFLINE=1, read at import
     here = "/opt/EasyNLA/experiments/qwen38_l42"
     shutil.copy(f"{here}/MODEL_CARD.md", f"{RELEASE}/README.md")
     shutil.copy(f"{here}/inference.py", f"{RELEASE}/inference.py")
